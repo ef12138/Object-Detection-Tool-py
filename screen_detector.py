@@ -10,7 +10,7 @@ import ctypes
 import os
 import glob
 import numpy as np
-import logitech.lg
+from control_utils import PID, calculate_fov_movement, start_mouse_move
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QComboBox, QSlider, QSpinBox, QDoubleSpinBox, QLineEdit, QTabWidget, QGroupBox,
                              QTextEdit, QFileDialog, QMessageBox, QSizePolicy, QSplitter, QDialog, QScrollArea)
@@ -20,67 +20,6 @@ from PyQt6.QtSvg import QSvgRenderer
 from PIL import Image
 from ultralytics import YOLO
 from pynput import mouse
-
-
-class PIDController:
-	"""PID控制器"""
-	
-	def __init__(self, kp, ki, kd, output_min=-100, output_max=100):
-		self.kp = kp  # 比例增益
-		self.ki = ki  # 积分增益
-		self.kd = kd  # 微分增益
-		self.output_min = output_min
-		self.output_max = output_max
-		
-		# 状态变量
-		self.integral = 0.0
-		self.prev_error = 0.0
-		self.last_time = time.perf_counter()
-	
-	def compute(self, setpoint, current_value):
-		"""计算PID控制输出"""
-		current_time = time.perf_counter()
-		dt = current_time - self.last_time
-		
-		# 防止过小的时间差导致计算问题
-		MIN_DT = 0.0001
-		if dt < MIN_DT:
-			dt = MIN_DT
-		
-		# 计算误差
-		error = setpoint - current_value
-		
-		# 比例项
-		P = self.kp * error
-		
-		# 积分项（防饱和）
-		self.integral += error * dt
-		I = self.ki * self.integral
-		
-		# 微分项
-		derivative = (error - self.prev_error) / dt
-		D = self.kd * derivative
-		
-		# 合成输出
-		output = P + I + D
-		
-		# 输出限幅
-		if output > self.output_max:
-			output = self.output_max
-		elif output < self.output_min:
-			output = self.output_min
-		
-		# 更新状态
-		self.prev_error = error
-		self.last_time = current_time
-		
-		return output
-	
-	def reset(self):
-		"""重置控制器状态"""
-		self.integral = 0.0
-		self.prev_error = 0.0
-		self.last_time = time.perf_counter()
 
 
 class ScreenDetector:
@@ -122,8 +61,19 @@ class ScreenDetector:
 		"""解析并存储配置参数"""
 		self.cfg = self._parse_txt_config(config_path)
 		
+		# 获取应用程序根目录
+		if getattr(sys, 'frozen', False):
+			base_path = os.path.dirname(sys._MEIPASS)
+		else:
+			base_path = os.path.dirname(os.path.abspath(__file__))
+		
+		# 处理模型路径 - 如果是相对路径则转换为绝对路径
+		model_path = self.cfg['model_path']
+		if not os.path.isabs(model_path):
+			model_path = os.path.normpath(os.path.join(base_path, model_path))
+		self.model_path = model_path
+		
 		# 存储常用参数
-		self.model_path = self.cfg['model_path']
 		self.model_device = self.cfg['model_device']
 		self.screen_target_size = int(self.cfg['screen_target_size'])
 		self.detection_conf_thres = float(self.cfg['detection_conf_thres'])
@@ -133,8 +83,12 @@ class ScreenDetector:
 		self.visualization_line_width = int(self.cfg['visualization_line_width'])
 		self.visualization_font_scale = float(self.cfg['visualization_font_scale'])
 		self.visualization_show_conf = bool(self.cfg['visualization_show_conf'])
+		
+		# FOV参数
 		self.fov_horizontal = float(self.cfg.get('move_fov_horizontal', '90'))
 		self.mouse_dpi = int(self.cfg.get('move_mouse_dpi', '400'))
+		
+		# 目标偏移量参数
 		self.target_offset_x_percent = float(self.cfg.get('target_offset_x', '50'))
 		self.target_offset_y_percent = 100 - float(self.cfg.get('target_offset_y', '50'))
 		
@@ -147,12 +101,18 @@ class ScreenDetector:
 		self.bezier_steps = int(self.cfg.get('bezier_steps', '100'))
 		self.bezier_duration = float(self.cfg.get('bezier_duration', '0.1'))
 		self.bezier_curve = float(self.cfg.get('bezier_curve', '0.3'))
+		
+		# 快捷键设置
+		self.inference_hotkey = self.cfg.get('inference_hotkey', 'F1')
 	
 	def update_config(self, config_path):
 		"""动态更新配置"""
 		try:
 			# 重新解析配置文件
 			self._parse_config(config_path)
+			
+			# 更新瞄准按键
+			self.aim_button = self._get_aim_button_from_config()
 			
 			# 更新可以直接修改的参数
 			self.detection_conf_thres = float(self.cfg['detection_conf_thres'])
@@ -166,8 +126,8 @@ class ScreenDetector:
 			self.pid_kd = float(self.cfg.get('pid_kd', '0.2'))
 			
 			# 更新PID控制器
-			self.pid_x = PIDController(self.pid_kp, self.pid_ki, self.pid_kd)
-			self.pid_y = PIDController(self.pid_kp, self.pid_ki, self.pid_kd)
+			self.pid_x = PID(self.pid_kp, self.pid_ki, self.pid_kd)
+			self.pid_y = PID(self.pid_kp, self.pid_ki, self.pid_kd)
 			
 			# FOV和DPI更新
 			self.fov_horizontal = float(self.cfg.get('move_fov_horizontal', '90'))
@@ -201,8 +161,8 @@ class ScreenDetector:
 	def _init_pid_controllers(self):
 		"""初始化PID控制器"""
 		# 创建XY方向的PID控制器
-		self.pid_x = PIDController(self.pid_kp, self.pid_ki, self.pid_kd)
-		self.pid_y = PIDController(self.pid_kp, self.pid_ki, self.pid_kd)
+		self.pid_x = PID(self.pid_kp, self.pid_ki, self.pid_kd)
+		self.pid_y = PID(self.pid_kp, self.pid_ki, self.pid_kd)
 	
 	def start_inference(self):
 		"""启动推理"""
@@ -241,7 +201,7 @@ class ScreenDetector:
 		self.previous_target_info = None
 		self.closest_target_absolute = None
 		self.target_offset = None
-		self.right_button_pressed = False  # 改为鼠标右键状态
+		self.aim_button_pressed = False  # 改为通用的瞄准按键状态
 	
 	def _init_camera(self):
 		"""初始化相机"""
@@ -266,27 +226,36 @@ class ScreenDetector:
 	
 	def _init_mouse_listener(self):
 		"""初始化鼠标监听器"""
+		# 读取配置的瞄准按键
+		self.aim_button = self._get_aim_button_from_config()
+		
 		self.mouse_listener = mouse.Listener(
-			on_click=self.on_mouse_click  # 监听鼠标点击事件
+			on_click=self.on_mouse_click
 		)
 		self.mouse_listener.daemon = True
 		self.mouse_listener.start()
 	
+	def _get_aim_button_from_config(self):
+		"""从配置中获取瞄准按键"""
+		button_mapping = {
+			"鼠标左键": mouse.Button.left,
+			"鼠标右键": mouse.Button.right,
+			"鼠标中键": mouse.Button.middle,
+			"鼠标侧键1": mouse.Button.x1,
+			"鼠标侧键2": mouse.Button.x2
+		}
+		
+		aim_button_name = self.cfg.get('aim_button', '鼠标右键')
+		return button_mapping.get(aim_button_name, mouse.Button.right)
+	
 	def on_mouse_click(self, x, y, button, pressed):
 		"""处理鼠标点击事件"""
 		try:
-			if button == mouse.Button.right:  # 监听鼠标右键
-				"""
-				mouse.Button.left - 左键
-				mouse.Button.right - 右键
-				mouse.Button.middle - 中键
-				mouse.Button.x1 - 侧键1（前进键）
-				mouse.Button.x2 - 侧键2（后退键）
-				更多键位自行了解pynput.mouse.Button用法
-				"""
+			# 使用配置的瞄准按键，而不是硬编码的右键
+			if button == self.aim_button:
 				with self.button_lock:
-					self.right_button_pressed = pressed  # 更新状态
-					# 当右键释放时重置PID控制器
+					self.aim_button_pressed = pressed  # 重命名变量以反映通用性
+					# 当瞄准按键释放时重置PID控制器
 					if not pressed:
 						self.pid_x.reset()
 						self.pid_y.reset()
@@ -294,27 +263,14 @@ class ScreenDetector:
 			print(f"鼠标事件处理错误: {str(e)}")
 	
 	def calculate_fov_movement(self, dx, dy):
-		"""基于FOV算法计算鼠标移动量"""
-		# 计算屏幕对角线长度
-		screen_diagonal = (self.screen_width ** 2 + self.screen_height ** 2) ** 0.5
-		
-		# 计算垂直FOV
-		aspect_ratio = self.screen_width / self.screen_height
-		fov_vertical = self.fov_horizontal / aspect_ratio
-		
-		# 计算每像素对应角度
-		angle_per_pixel_x = self.fov_horizontal / self.screen_width
-		angle_per_pixel_y = fov_vertical / self.screen_height
-		
-		# 计算角度偏移
-		angle_offset_x = dx * angle_per_pixel_x
-		angle_offset_y = dy * angle_per_pixel_y
-		
-		# 转换为鼠标移动量
-		move_x = (angle_offset_x / 360) * self.mouse_dpi
-		move_y = (angle_offset_y / 360) * self.mouse_dpi
-		
-		return move_x, move_y
+		"""初始化FOV"""
+		return calculate_fov_movement(
+			dx, dy,
+			self.screen_width,
+			self.screen_height,
+			self.fov_horizontal,
+			self.mouse_dpi
+		)
 	
 	def move_mouse_to_target(self):
 		"""移动鼠标对准目标点"""
@@ -329,13 +285,14 @@ class ScreenDetector:
 			# 使用FOV算法将像素偏移转换为鼠标移动量
 			move_x, move_y = self.calculate_fov_movement(dx, dy)
 			
-			# 使用PID计算平滑的移动量
-			pid_move_x = self.pid_x.compute(0, -move_x)  # 将dx取反
-			pid_move_y = self.pid_y.compute(0, -move_y)  # 将dy取反
+			# 使用PID计算的移动量
+			pid_move_x = self.pid_x.pidPosition(0, -move_x)  # 将dx取反
+			pid_move_y = self.pid_y.pidPosition(0, -move_y)  # 将dy取反
 			
 			# 移动鼠标
 			if pid_move_x != 0 or pid_move_y != 0:
-				logitech.lg.start_mouse_move(int(pid_move_x), int(pid_move_y), self.bezier_steps, self.bezier_duration, self.bezier_curve)
+				start_mouse_move(int(pid_move_x), int(pid_move_y), self.bezier_steps, self.bezier_duration,
+				                 self.bezier_curve)
 		except Exception as e:
 			print(f"移动鼠标时出错: {str(e)}")
 	
@@ -503,7 +460,7 @@ class ScreenDetector:
 	def _move_mouse_if_needed(self):
 		"""如果需要则移动鼠标"""
 		with self.button_lock:
-			if self.right_button_pressed and self.target_offset:  # 使用right_button_pressed
+			if self.aim_button_pressed and self.target_offset:  # 使用通用变量名
 				self.move_mouse_to_target()
 	
 	def _reset_camera(self):
@@ -552,6 +509,104 @@ class DetectionThread(QThread):
 		self.detector.stop()
 
 
+class MouseButtonLineEdit(QLineEdit):
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self.setReadOnly(True)
+		self.setPlaceholderText("长按此处然后按下鼠标按键...")
+		self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+		self.current_button = ""
+		self.listening = False
+		self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)# 禁用上下文菜单
+		self.setStyleSheet("""
+            QLineEdit {
+                background-color: #3C3C40;
+                color: #D4D4D4;
+                border: 2px solid #0078D7;
+                border-radius: 4px;
+                padding: 5px;
+                font-family: Consolas;
+                font-size: 10pt;
+            }
+            QLineEdit:focus {
+                border-color: #4CAF50;
+            }
+        """)
+	
+	def mousePressEvent(self, event):
+		if event.button() == Qt.MouseButton.LeftButton:
+			self.start_listening()
+		super().mousePressEvent(event)
+	
+	def start_listening(self):
+		self.listening = True
+		self.current_button = ""
+		self.setText("")
+		self.setPlaceholderText("正在监听鼠标按键...")
+		self.setStyleSheet("""
+            QLineEdit {
+                background-color: #2D2D30;
+                color: #4CAF50;
+                border: 2px solid #4CAF50;
+                border-radius: 4px;
+                padding: 5px;
+                font-family: Consolas;
+                font-size: 10pt;
+            }
+        """)
+		self.setFocus()
+	
+	def keyPressEvent(self, event):
+		# 阻止键盘事件，只监听鼠标
+		if self.listening:
+			event.accept()
+		else:
+			super().keyPressEvent(event)
+	
+	def mouseReleaseEvent(self, event):
+		if not self.listening:
+			super().mouseReleaseEvent(event)
+			return
+		
+		# 获取按下的鼠标按钮
+		button = event.button()
+		button_name = self.get_button_name(button)
+		
+		if button_name:
+			self.current_button = button_name
+			self.setText(button_name)
+			self.listening = False
+			self.setStyleSheet("""
+                QLineEdit {
+                    background-color: #3C3C40;
+                    color: #D4D4D4;
+                    border: 1px solid #3F3F46;
+                    border-radius: 4px;
+                    padding: 5px;
+                    font-family: Consolas;
+                    font-size: 10pt;
+                }
+            """)
+		
+		event.accept()
+	
+	def get_button_name(self, button):
+		button_map = {
+			Qt.MouseButton.LeftButton: "鼠标左键",
+			Qt.MouseButton.RightButton: "鼠标右键",
+			Qt.MouseButton.MiddleButton: "鼠标中键",
+			Qt.MouseButton.BackButton: "鼠标侧键1",
+			Qt.MouseButton.ForwardButton: "鼠标侧键2",
+			Qt.MouseButton.XButton1: "鼠标侧键1",
+			Qt.MouseButton.XButton2: "鼠标侧键2"
+		}
+		return button_map.get(button, "")
+	
+	def get_button(self):
+		"""获取格式化后的鼠标按钮字符串"""
+		return self.current_button
+
+
 class MainWindow(QMainWindow):
 	def __init__(self, detector):
 		super().__init__()
@@ -559,11 +614,34 @@ class MainWindow(QMainWindow):
 		self.setWindowTitle("Object Detection Tool-py")
 		self.setGeometry(100, 100, 600, 400)
 		
+		# 设置窗口图标
+		try:
+			# 获取当前脚本所在目录
+			base_path = os.path.dirname(os.path.abspath(__file__))
+			icon_path = os.path.join(base_path, 'logo.ico')
+			
+			# 检查图标文件是否存在
+			if os.path.exists(icon_path):
+				self.setWindowIcon(QIcon(icon_path))
+			else:
+				# 如果直接路径找不到，尝试在打包后的资源目录中查找
+				if getattr(sys, 'frozen', False):
+					base_path = sys._MEIPASS
+					icon_path = os.path.join(base_path, 'logo.ico')
+					if os.path.exists(icon_path):
+						self.setWindowIcon(QIcon(icon_path))
+					else:
+						print(f"警告: 图标文件未找到 - {icon_path}")
+				else:
+					print(f"警告: 图标文件未找到 - {icon_path}")
+		except Exception as e:
+			print(f"设置图标时出错: {str(e)}")
+		
 		# 添加缺失的属性初始化
 		self.visualization_enabled = True
 		self.inference_active = False  # 初始推理状态为停止
 		
-		#窗口置顶
+		# 窗口置顶
 		self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 		
 		# 创建帧队列
@@ -620,7 +698,7 @@ class MainWindow(QMainWindow):
                     border-radius: 4px;
                     font-family: Segoe UI;
                     font-size: 10pt;
-                    
+
                 }
             """)
 			self.detector.stop_inference()
@@ -738,7 +816,7 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover {
                 background-color: #45A049;
-                
+
             }
             QPushButton:pressed {
                 background-color: #3D8B40;
@@ -878,9 +956,9 @@ class MainWindow(QMainWindow):
 		self.target_info_text.setPlainText(info_text)
 	
 	def update_mouse_status(self):
-		"""更新鼠标右键状态显示"""
+		"""更新鼠标瞄准按键状态显示"""
 		with self.detector.button_lock:
-			if self.detector.right_button_pressed:
+			if self.detector.aim_button_pressed:  # 使用通用变量名
 				self.mouse_status.setText("瞄准中")
 				self.mouse_status.setStyleSheet("color: #4CAF50; font-family: Consolas; font-size: 10pt;")
 			else:
@@ -943,6 +1021,12 @@ class SettingsDialog(QDialog):
 		bezier_layout = QVBoxLayout(bezier_tab)
 		self.create_bezier_settings(bezier_layout)
 		tabs.addTab(bezier_tab, "贝塞尔曲线")
+		
+		# +++ 新增的快捷键设置标签页 +++
+		hotkey_tab = QWidget()
+		hotkey_layout = QVBoxLayout(hotkey_tab)
+		self.create_hotkey_settings(hotkey_layout)
+		tabs.addTab(hotkey_tab, "快捷键")
 		
 		# 按钮区域
 		btn_layout = QHBoxLayout()
@@ -1159,6 +1243,7 @@ class SettingsDialog(QDialog):
 		group_layout.addWidget(info_label)
 		
 		layout.addWidget(group)
+		
 		layout.addStretch()
 	
 	def create_pid_settings(self, layout):
@@ -1233,9 +1318,9 @@ class SettingsDialog(QDialog):
 	
 	# 创建贝塞尔曲线设置
 	def create_bezier_settings(self, layout):
+		
 		group = QGroupBox("贝塞尔曲线参数")
 		group_layout = QVBoxLayout(group)
-		
 		# 步数设置
 		group_layout.addWidget(QLabel("步数 (1-500):"))
 		steps_layout = QHBoxLayout()
@@ -1255,11 +1340,11 @@ class SettingsDialog(QDialog):
 		self.steps_slider.valueChanged.connect(lambda value: self.steps_value.setText(str(value)))
 		
 		# 总移动时间设置 (秒)
-		group_layout.addWidget(QLabel("总移动时间 (秒, 0.01-1.0):"))
+		group_layout.addWidget(QLabel("总移动时间 (秒):"))
 		duration_layout = QHBoxLayout()
 		
 		self.duration_slider = QSlider(Qt.Orientation.Horizontal)
-		self.duration_slider.setRange(1, 100)  # 0.01到1.0，步长0.01
+		self.duration_slider.setRange(0, 100)  # 0.01到1.0，步长0.01
 		self.duration_slider.setValue(int(float(self.config.get('bezier_duration', 0.1)) * 100))
 		duration_layout.addWidget(self.duration_slider)
 		
@@ -1302,12 +1387,86 @@ class SettingsDialog(QDialog):
 		layout.addWidget(group)
 		layout.addStretch()
 	
+	def create_hotkey_settings(self, layout):
+		"""创建快捷键设置"""
+		group = QGroupBox("鼠标按键设置")
+		group_layout = QVBoxLayout(group)
+		
+		# 鼠标按键设置
+		group_layout.addWidget(QLabel("瞄准按键:"))
+		
+		# 使用自定义的鼠标按键输入框
+		self.mouse_button_input = MouseButtonLineEdit()
+		
+		# 设置当前鼠标按键
+		current_mouse_button = self.config.get('aim_button', '鼠标右键')
+		if current_mouse_button:
+			self.mouse_button_input.setText(current_mouse_button)
+			self.mouse_button_input.current_button = current_mouse_button
+		
+		group_layout.addWidget(self.mouse_button_input)
+		
+		# 清除按钮
+		clear_btn = QPushButton("清除鼠标按键")
+		clear_btn.clicked.connect(self.clear_mouse_button)
+		clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF5252;
+                color: white;
+                border: none;
+                padding: 5px;
+                border-radius: 4px;
+                font-family: Segoe UI;
+                font-size: 9pt;
+            }
+            QPushButton:hover {
+                background-color: #E53935;
+            }
+        """)
+		group_layout.addWidget(clear_btn)
+		
+		# 鼠标按键说明
+		info_text = "鼠标按键设置说明:\n\n" \
+		            "• 长按输入框后按下想要的鼠标按键\n" \
+		            "• 支持所有标准鼠标按键\n" \
+		            "• 包括左右键、中键和侧键\n\n" \
+		            "常用推荐:\n" \
+		            "• 鼠标右键: 最常用，与游戏右键瞄准一致\n" \
+		
+		info_label = QLabel(info_text)
+		info_label.setStyleSheet("font-size: 9pt; color: #888888;")
+		info_label.setWordWrap(True)
+		group_layout.addWidget(info_label)
+		
+		layout.addWidget(group)
+		layout.addStretch()
+	
+	def clear_mouse_button(self):
+		"""清除鼠标按键"""
+		self.mouse_button_input.setText("")
+		self.mouse_button_input.current_button = ""
+		self.mouse_button_input.setPlaceholderText("长按此处然后按下鼠标按键...")
+	
 	def save_config(self):
 		try:
+			# 获取应用程序根目录
+			if getattr(sys, 'frozen', False):
+				base_path = os.path.dirname(sys._MEIPASS)
+			else:
+				base_path = os.path.dirname(os.path.abspath(__file__))
+			
 			# 保存配置到字典
 			model_name = self.model_combo.currentText()
 			model_path = self.model_name_to_path.get(model_name, model_name)
-			self.config['model_path'] = model_path
+			
+			# 保存鼠标按键设置
+			mouse_button = self.mouse_button_input.get_button()
+			if mouse_button:
+				self.config['aim_button'] = mouse_button
+			else:
+				# 如果没有设置鼠标按键，使用默认值
+				self.config['aim_button'] = '鼠标右键'
+			
 			self.config['model_device'] = self.device_combo.currentText()
 			self.config['screen_monitor'] = str(self.monitor_spin.value())
 			self.config['screen_target_size'] = str(self.screen_size_spin.value())
@@ -1334,6 +1493,14 @@ class SettingsDialog(QDialog):
 			self.config['bezier_steps'] = str(self.steps_slider.value())
 			self.config['bezier_duration'] = str(self.duration_slider.value() / 100)
 			self.config['bezier_curve'] = str(self.curve_slider.value() / 100)
+			
+			# 保存鼠标按键设置
+			mouse_button = self.mouse_button_input.get_button()
+			if mouse_button:
+				self.config['aim_button'] = mouse_button
+			else:
+				# 如果没有设置鼠标按键，使用默认值
+				self.config['aim_button'] = '鼠标右键'
 			
 			# 保存为TXT格式
 			with open('detection_config.txt', 'w', encoding='utf-8') as f:
