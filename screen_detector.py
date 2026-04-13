@@ -276,6 +276,14 @@ class ScreenDetector:
 		"""处理鼠标点击事件"""
 		try:
 			if button == mouse.Button.right:  # 监听鼠标右键
+				"""
+				mouse.Button.left - 左键
+				mouse.Button.right - 右键
+				mouse.Button.middle - 中键
+				mouse.Button.x1 - 侧键1（前进键）
+				mouse.Button.x2 - 侧键2（后退键）
+				更多键位自行了解pynput.mouse.Button用法
+				"""
 				with self.button_lock:
 					self.right_button_pressed = pressed  # 更新状态
 					# 当右键释放时重置PID控制器
